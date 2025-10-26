@@ -1,0 +1,47 @@
+spring:
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://<POSTGRES_SERVER>.postgres.database.azure.com:5432/<DB_NAME>?sslmode=require}
+    username: ${SPRING_DATASOURCE_USERNAME:myAppUami}
+    azure:
+      passwordless-enabled: true
+  sql:
+    init:
+      mode: always
+  cloud:
+    azure:
+      credential:
+        managed-identity-enabled: true
+        client-id: ${AZURE_CLIENT_ID:}
+      profile:
+        tenant-id: ${SPRING_CLOUD_AZURE_PROFILE_TENANT_ID:<YOUR_TENANT_ID>}
+
+# Token Debug Configuration (for testing only)
+azure:
+  token:
+    debug:
+      enabled: ${AZURE_TOKEN_DEBUG_ENABLED:false}
+      expiry-minutes: ${AZURE_TOKEN_DEBUG_EXPIRY_MINUTES:2}
+
+# Optional: enable actuator health
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+
+logging:
+  level:
+    root: INFO
+    com.example.azure: DEBUG
+    # Azure Identity SDK - Shows token acquisition and refresh
+    com.azure.identity: TRACE
+    com.microsoft.aad.msal4j: DEBUG
+    # Azure Core HTTP - Shows HTTP requests including token requests
+    com.azure.core.http: DEBUG
+    # Spring Cloud Azure - Shows passwordless configuration
+    com.azure.spring.cloud: DEBUG
+    com.azure.spring.cloud.autoconfigure: DEBUG
+    # HikariCP - Shows connection pool behavior
+    com.zaxxer.hikari: DEBUG
+    # PostgreSQL Driver - Shows database authentication
+    org.postgresql: TRACE
