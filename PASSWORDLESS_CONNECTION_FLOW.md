@@ -8,13 +8,14 @@ Complete technical documentation of how Azure Managed Identity passwordless auth
 
 1. [Overview](#overview)
 2. [Architecture Components](#architecture-components)
-3. [Complete Flow Diagram](#complete-flow-diagram)
-4. [Phase-by-Phase Breakdown](#phase-by-phase-breakdown)
-5. [Key Mechanisms](#key-mechanisms)
-6. [Token Lifecycle](#token-lifecycle)
-7. [Connection Lifecycle](#connection-lifecycle)
-8. [Timing and Refresh Behavior](#timing-and-refresh-behavior)
-9. [Sources and References](#sources-and-references)
+3. [Spring Cloud Azure Property Loading](#spring-cloud-azure-property-loading)
+4. [Complete Flow Diagram](#complete-flow-diagram)
+5. [Phase-by-Phase Breakdown](#phase-by-phase-breakdown)
+6. [Key Mechanisms](#key-mechanisms)
+7. [Token Lifecycle](#token-lifecycle)
+8. [Connection Lifecycle](#connection-lifecycle)
+9. [Timing and Refresh Behavior](#timing-and-refresh-behavior)
+10. [Sources and References](#sources-and-references)
 
 ---
 
@@ -53,6 +54,575 @@ This application uses **Azure Managed Identity** to authenticate to **Azure Data
 - **Azure Database for PostgreSQL Flexible Server**
 - **Azure AD** (issues OAuth tokens)
 - **Azure IMDS** (Instance Metadata Service - provides tokens)
+
+---
+
+## Spring Cloud Azure Property Loading
+
+This section explains **exactly where and how** the Spring Cloud Azure properties from `application.yml` are loaded, bound to Java objects, and used to configure the ManagedIdentityCredential.
+
+### Property Configuration Classes
+
+Spring Cloud Azure uses `@ConfigurationProperties` to bind YAML configuration to Java objects.
+
+#### 1. Root Configuration: AzureGlobalProperties
+
+**Class:** `com.azure.spring.cloud.autoconfigure.implementation.context.properties.AzureGlobalProperties`
+
+**Source JAR:** `~/.m2/repository/com/azure/spring/spring-cloud-azure-autoconfigure/5.23.0/spring-cloud-azure-autoconfigure-5.23.0.jar`
+
+```java
+@ConfigurationProperties(prefix = "spring.cloud.azure")
+public class AzureGlobalProperties {
+
+    @NestedConfigurationProperty
+    private final TokenCredentialConfigurationProperties credential =
+        new TokenCredentialConfigurationProperties();
+
+    @NestedConfigurationProperty
+    private final GlobalProfileConfigurationProperties profile =
+        new GlobalProfileConfigurationProperties();
+
+    // Other properties...
+}
+```
+
+**YAML Binding:**
+```yaml
+spring:
+  cloud:
+    azure:  # ← Prefix matches @ConfigurationProperties
+      credential:  # ← Maps to TokenCredentialConfigurationProperties
+      profile:     # ← Maps to GlobalProfileConfigurationProperties
+```
+
+#### 2. Credential Configuration: TokenCredentialConfigurationProperties
+
+**Class:** `com.azure.spring.cloud.autoconfigure.implementation.properties.core.authentication.TokenCredentialConfigurationProperties`
+
+```java
+public class TokenCredentialConfigurationProperties
+    implements TokenCredentialOptionsProvider.TokenCredentialOptions {
+
+    private String clientId;                          // Maps to: client-id
+    private String clientSecret;                      // Maps to: client-secret
+    private String clientCertificatePath;             // Maps to: client-certificate-path
+    private String clientCertificatePassword;         // Maps to: client-certificate-password
+    private String username;                          // Maps to: username
+    private String password;                          // Maps to: password
+    private boolean managedIdentityEnabled = false;   // Maps to: managed-identity-enabled
+    private String tokenCredentialBeanName;           // Maps to: token-credential-bean-name
+}
+```
+
+**YAML Binding:**
+```yaml
+spring:
+  cloud:
+    azure:
+      credential:
+        managed-identity-enabled: true     # → managedIdentityEnabled = true
+        client-id: ${AZURE_CLIENT_ID:}    # → clientId = "d8db0245-bcb2-4cd0-9ddc-8169d952fa7a"
+```
+
+#### 3. Profile Configuration: AzureProfileConfigurationProperties
+
+**Class:** `com.azure.spring.cloud.autoconfigure.implementation.properties.core.profile.AzureProfileConfigurationProperties`
+
+```java
+public class AzureProfileConfigurationProperties
+    implements AzureProfileOptionsProvider.ProfileOptions {
+
+    private String tenantId;              // Maps to: tenant-id
+    private String subscriptionId;        // Maps to: subscription-id
+    private CloudType cloudType;          // Maps to: cloud-type
+    private final AzureEnvironmentConfigurationProperties environment;
+}
+```
+
+**YAML Binding:**
+```yaml
+spring:
+  cloud:
+    azure:
+      profile:
+        tenant-id: ${SPRING_CLOUD_AZURE_PROFILE_TENANT_ID}  # → tenantId = "b41b72d0-4e9f-4c26-8a69-f949f367c91d"
+```
+
+### Auto-Configuration Classes
+
+These classes create and register Spring beans using the bound properties.
+
+#### 1. AzureGlobalPropertiesAutoConfiguration
+
+**Class:** `com.azure.spring.cloud.autoconfigure.implementation.context.AzureGlobalPropertiesAutoConfiguration`
+
+**Purpose:** Registers the `AzureGlobalProperties` bean during Spring Bootstrap phase.
+
+```java
+public static class Registrar implements ImportBeanDefinitionRegistrar, EnvironmentAware {
+
+    private Environment environment;
+
+    @Override
+    public void registerBeanDefinitions(AnnotationMetadata importingClassMetadata,
+                                        BeanDefinitionRegistry registry) {
+        if (!registry.containsBeanDefinition(AZURE_GLOBAL_PROPERTY_BEAN_NAME)) {
+            // Uses Spring's Binder to bind properties from Environment to AzureGlobalProperties
+            BeanDefinitionBuilder definitionBuilder = genericBeanDefinition(
+                AzureGlobalProperties.class,
+                () -> Binder.get(this.environment)
+                           .bindOrCreate(
+                               AzureGlobalProperties.PREFIX,  // "spring.cloud.azure"
+                               AzureGlobalProperties.class
+                           )
+            );
+
+            // Register bean with name: "springCloudAzureGlobalProperties"
+            registry.registerBeanDefinition(
+                AZURE_GLOBAL_PROPERTY_BEAN_NAME,
+                definitionBuilder.getBeanDefinition()
+            );
+        }
+    }
+}
+```
+
+**Bean Name:** `"springCloudAzureGlobalProperties"` (defined in `AzureContextUtils.java`)
+
+#### 2. AzureTokenCredentialAutoConfiguration
+
+**Class:** `com.azure.spring.cloud.autoconfigure.implementation.context.AzureTokenCredentialAutoConfiguration`
+
+**Purpose:** Creates the appropriate `TokenCredential` bean based on properties.
+
+```java
+@Configuration
+@ConditionalOnClass(TokenCredential.class)
+@AutoConfigureAfter(TaskExecutionAutoConfiguration.class)
+@Import(AzureGlobalPropertiesAutoConfiguration.Registrar.class)
+public class AzureTokenCredentialAutoConfiguration {
+
+    @Bean
+    @ConditionalOnMissingBean
+    public TokenCredential springCloudAzureDefaultCredential(
+            AzureGlobalProperties properties,
+            ObjectProvider<ManagedIdentityCredentialBuilderFactory> managedIdentityCredentialBuilderFactoryProvider,
+            // ... other parameters
+    ) throws Exception {
+
+        // Resolve credential based on properties
+        return new AzureTokenCredentialResolver()
+            .resolve(properties.getCredential());
+    }
+}
+```
+
+**AzureTokenCredentialResolver Logic:**
+
+```java
+public class AzureTokenCredentialResolver {
+
+    public TokenCredential resolve(TokenCredentialConfigurationProperties properties) {
+
+        String clientId = properties.getClientId();
+        String tenantId = properties.getTenantId();
+        boolean isClientIdSet = StringUtils.hasText(clientId);
+
+        // 1. Custom bean name specified?
+        if (StringUtils.hasText(properties.getTokenCredentialBeanName())) {
+            return null;  // Use custom bean
+        }
+
+        // 2. Client Secret Credential?
+        if (StringUtils.hasText(tenantId)
+            && isClientIdSet
+            && StringUtils.hasText(properties.getClientSecret())) {
+            return new ClientSecretCredentialBuilder()
+                .tenantId(tenantId)
+                .clientId(clientId)
+                .clientSecret(properties.getClientSecret())
+                .build();
+        }
+
+        // 3. Client Certificate Credential?
+        if (StringUtils.hasText(tenantId)
+            && isClientIdSet
+            && StringUtils.hasText(properties.getClientCertificatePath())) {
+            return new ClientCertificateCredentialBuilder()
+                .tenantId(tenantId)
+                .clientId(clientId)
+                .pemCertificate(properties.getClientCertificatePath())
+                .build();
+        }
+
+        // 4. Username/Password Credential?
+        if (isClientIdSet
+            && StringUtils.hasText(properties.getUsername())
+            && StringUtils.hasText(properties.getPassword())) {
+            return new UsernamePasswordCredentialBuilder()
+                .clientId(clientId)
+                .username(properties.getUsername())
+                .password(properties.getPassword())
+                .build();
+        }
+
+        // 5. Managed Identity Credential? ✓ THIS ONE for your app
+        if (properties.isManagedIdentityEnabled()) {
+            ManagedIdentityCredentialBuilder builder =
+                managedIdentityCredentialBuilderFactory.build();
+
+            if (isClientIdSet) {
+                builder.clientId(clientId);  // User-Assigned Managed Identity
+            }
+            // If clientId not set, uses System-Assigned Managed Identity
+
+            return builder.build();
+        }
+
+        // 6. Fall back to DefaultAzureCredential
+        return null;
+    }
+}
+```
+
+**For Your Application:**
+Since `managed-identity-enabled: true` and `client-id` is set, this creates:
+```java
+new ManagedIdentityCredentialBuilder()
+    .clientId("d8db0245-bcb2-4cd0-9ddc-8169d952fa7a")  // User-Assigned MSI
+    .build()
+```
+
+#### 3. AzureJdbcAutoConfiguration
+
+**Class:** `com.azure.spring.cloud.autoconfigure.implementation.jdbc.AzureJdbcAutoConfiguration`
+
+**Purpose:** Integrates Azure credentials with JDBC DataSource.
+
+```java
+@Configuration
+@ConditionalOnBean(DataSourceProperties.class)
+@ConditionalOnClass(AzureAuthenticationTemplate.class)
+@AutoConfigureAfter(DataSourceAutoConfiguration.class)
+@Import(AzureGlobalPropertiesAutoConfiguration.Registrar.class)
+public class AzureJdbcAutoConfiguration {
+
+    @Bean
+    @ConditionalOnMissingBean
+    static JdbcPropertiesBeanPostProcessor jdbcConfigurationPropertiesBeanPostProcessor() {
+        return new JdbcPropertiesBeanPostProcessor();
+    }
+}
+```
+
+#### 4. JdbcPropertiesBeanPostProcessor
+
+**Class:** `com.azure.spring.cloud.autoconfigure.implementation.jdbc.JdbcPropertiesBeanPostProcessor`
+
+**Purpose:** Intercepts DataSource bean creation and enhances JDBC URL for passwordless auth.
+
+```java
+@Order(Ordered.HIGHEST_PRECEDENCE + 3)
+public class JdbcPropertiesBeanPostProcessor
+    implements BeanPostProcessor, EnvironmentAware, ApplicationContextAware {
+
+    @Override
+    public Object postProcessBeforeInitialization(Object bean, String beanName) {
+
+        if (bean instanceof DataSourceProperties) {
+            DataSourceProperties dataSourceProperties = (DataSourceProperties) bean;
+
+            // Build Azure properties (merges global + datasource-specific)
+            AzureJdbcPasswordlessProperties properties =
+                buildAzureProperties("spring.datasource.azure");
+
+            // Check if passwordless is enabled
+            if (!properties.isPasswordlessEnabled()) {
+                return bean;  // Skip if disabled
+            }
+
+            // Get the TokenCredential bean
+            TokenCredential credential = applicationContext.getBean(TokenCredential.class);
+
+            // Enhance JDBC URL with authentication plugin parameters
+            JdbcConnectionStringEnhancer enhancer = new JdbcConnectionStringEnhancer();
+            String enhancedUrl = enhancer.enhance(
+                dataSourceProperties.getUrl(),
+                properties,
+                credential
+            );
+
+            // Update DataSource URL
+            dataSourceProperties.setUrl(enhancedUrl);
+        }
+
+        return bean;
+    }
+
+    private AzureJdbcPasswordlessProperties buildAzureProperties(String prefix) {
+        // Get global properties bean
+        AzureGlobalProperties globalProps =
+            applicationContext.getBean(AzureGlobalProperties.class);
+
+        // Bind datasource-specific properties
+        AzureJdbcPasswordlessProperties dsProps =
+            Binder.get(environment).bindOrCreate(prefix, AzureJdbcPasswordlessProperties.class);
+
+        // Merge global and datasource-specific properties
+        AzureJdbcPasswordlessProperties merged = new AzureJdbcPasswordlessProperties();
+        AzurePasswordlessPropertiesUtils.mergeAzureCommonProperties(
+            globalProps,
+            dsProps,
+            merged
+        );
+
+        return merged;
+    }
+}
+```
+
+### Complete Property Loading Flow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ 1. Application Startup                                          │
+│    Spring Boot reads application.yml                            │
+└─────────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 2. AzureGlobalPropertiesAutoConfiguration.Registrar             │
+│    - Triggered during Bootstrap phase                           │
+│    - Uses Binder.get(environment)                               │
+│    - Binds "spring.cloud.azure.*" to AzureGlobalProperties      │
+│    - Registers bean: "springCloudAzureGlobalProperties"         │
+└─────────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 3. Property Binding via Spring Binder                           │
+│                                                                 │
+│    application.yml                                              │
+│    ├─ spring.cloud.azure.credential.managed-identity-enabled    │
+│    │    → TokenCredentialConfigurationProperties                │
+│    │         .managedIdentityEnabled = true                     │
+│    ├─ spring.cloud.azure.credential.client-id                   │
+│    │    → TokenCredentialConfigurationProperties                │
+│    │         .clientId = "d8db0245-bcb2-4cd0-9ddc-8169d952fa7a" │
+│    └─ spring.cloud.azure.profile.tenant-id                      │
+│         → AzureProfileConfigurationProperties                   │
+│              .tenantId = "b41b72d0-4e9f-4c26-8a69-f949f367c91d" │
+└─────────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 4. AzureGlobalProperties Bean Created                           │
+│                                                                 │
+│    AzureGlobalProperties {                                      │
+│      credential: TokenCredentialConfigurationProperties {       │
+│        managedIdentityEnabled: true,                            │
+│        clientId: "d8db0245-bcb2-4cd0-9ddc-8169d952fa7a"        │
+│      },                                                         │
+│      profile: AzureProfileConfigurationProperties {             │
+│        tenantId: "b41b72d0-4e9f-4c26-8a69-f949f367c91d"        │
+│      }                                                          │
+│    }                                                            │
+└─────────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 5. AzureTokenCredentialAutoConfiguration                        │
+│    - @Bean method: springCloudAzureDefaultCredential()          │
+│    - Injects: AzureGlobalProperties                             │
+│    - Calls: AzureTokenCredentialResolver.resolve()              │
+└─────────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 6. AzureTokenCredentialResolver Logic                           │
+│                                                                 │
+│    if (properties.isManagedIdentityEnabled()) {  ✓ TRUE         │
+│        ManagedIdentityCredentialBuilder builder =               │
+│            managedIdentityCredentialBuilderFactory.build();     │
+│                                                                 │
+│        if (isClientIdSet) {  ✓ TRUE                             │
+│            builder.clientId("d8db0245-bcb2-4cd0-9ddc-...");     │
+│        }                                                        │
+│                                                                 │
+│        return builder.build();  ← ManagedIdentityCredential     │
+│    }                                                            │
+└─────────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 7. TokenCredential Bean Registered                              │
+│    - Bean Name: "springCloudAzureDefaultCredential"             │
+│    - Bean Type: ManagedIdentityCredential                       │
+│    - Client ID: d8db0245-bcb2-4cd0-9ddc-8169d952fa7a (UAMI)    │
+└─────────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 8. DataSourceAutoConfiguration                                  │
+│    - Creates DataSourceProperties bean                          │
+│    - Reads spring.datasource.* properties                       │
+└─────────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 9. JdbcPropertiesBeanPostProcessor Intercepts                   │
+│    - postProcessBeforeInitialization(DataSourceProperties)      │
+│    - Merges global + datasource-specific properties             │
+│    - Checks: passwordless-enabled = true ✓                      │
+│    - Gets: TokenCredential bean                                 │
+│    - Enhances JDBC URL with auth plugin parameters              │
+└─────────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 10. Enhanced JDBC URL                                           │
+│                                                                 │
+│     Original:                                                   │
+│     jdbc:postgresql://pg-flex.postgres.database.azure.com:5432/ │
+│       appdb?sslmode=require                                     │
+│                                                                 │
+│     Enhanced:                                                   │
+│     jdbc:postgresql://pg-flex.postgres.database.azure.com:5432/ │
+│       appdb?sslmode=require                                     │
+│       &authenticationPluginClassName=                           │
+│         com.azure.identity.extensions.jdbc.postgresql.          │
+│           AzurePostgresqlAuthenticationPlugin                   │
+│       &azure.clientId=d8db0245-bcb2-4cd0-9ddc-8169d952fa7a     │
+│       &azure.managedIdentityEnabled=true                        │
+│       &azure.scopes=                                            │
+│         https://ossrdbms-aad.database.windows.net/.default      │
+│       &azure.tenantId=b41b72d0-4e9f-4c26-8a69-f949f367c91d     │
+└─────────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 11. HikariCP DataSource Creation                                │
+│     - Uses enhanced JDBC URL                                    │
+│     - PostgreSQL driver loads authentication plugin             │
+│     - Plugin uses ManagedIdentityCredential to get tokens       │
+└─────────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 12. Database Connection with Token                              │
+│     - Plugin calls: credential.getToken(scopes)                 │
+│     - ManagedIdentityCredential requests from Azure IMDS        │
+│     - Token used as password field                              │
+│     - PostgreSQL validates token                                │
+│     - Connection established ✓                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Property Merging Strategy
+
+Spring Cloud Azure uses a **hierarchical property merging** system:
+
+1. **Global Properties**: `spring.cloud.azure.*` (applies to all Azure services)
+2. **Service-Specific Properties**: `spring.datasource.azure.*` (overrides global for JDBC only)
+
+**Merge Logic in JdbcPropertiesBeanPostProcessor:**
+```java
+AzurePasswordlessPropertiesUtils.mergeAzureCommonProperties(
+    globalProperties,      // From spring.cloud.azure.*
+    datasourceProperties,  // From spring.datasource.azure.*
+    mergedProperties       // Result (datasource overrides global)
+);
+```
+
+**Example:**
+```yaml
+spring:
+  cloud:
+    azure:
+      credential:
+        client-id: global-client-id        # Applied to all services
+  datasource:
+    azure:
+      credential:
+        client-id: datasource-client-id    # Overrides for JDBC only
+```
+Result: JDBC uses `datasource-client-id`, other services use `global-client-id`.
+
+### Property Resolution Order
+
+When resolving a property like `client-id`, Spring follows this order:
+
+1. **Environment Variable**: `AZURE_CLIENT_ID` (if using `${AZURE_CLIENT_ID}`)
+2. **System Property**: `-Dspring.cloud.azure.credential.client-id=...`
+3. **application.yml**: Explicit value in configuration file
+4. **Default Value**: If specified in `${AZURE_CLIENT_ID:default-value}`
+
+**Your Configuration:**
+```yaml
+spring:
+  cloud:
+    azure:
+      credential:
+        client-id: ${AZURE_CLIENT_ID:}    # Uses env var, empty string if not set
+```
+
+Azure App Service automatically sets:
+- `AZURE_CLIENT_ID=d8db0245-bcb2-4cd0-9ddc-8169d952fa7a`
+- `MSI_ENDPOINT=http://169.254.169.254/...`
+- `MSI_SECRET=[secret-value]`
+
+### Key Bean Names Reference
+
+| Bean Name | Class | Configuration Prefix |
+|-----------|-------|----------------------|
+| `springCloudAzureGlobalProperties` | `AzureGlobalProperties` | `spring.cloud.azure` |
+| `springCloudAzureDefaultCredential` | `TokenCredential` (ManagedIdentityCredential) | N/A (created from properties) |
+| `dataSource` | `HikariDataSource` | `spring.datasource` |
+| (anonymous) | `JdbcPropertiesBeanPostProcessor` | N/A (BeanPostProcessor) |
+
+### Source Code Locations
+
+All these classes are in the **spring-cloud-azure-autoconfigure** library:
+
+```
+Maven Repository:
+~/.m2/repository/com/azure/spring/spring-cloud-azure-autoconfigure/5.23.0/
+
+JARs:
+├─ spring-cloud-azure-autoconfigure-5.23.0.jar          (compiled classes)
+└─ spring-cloud-azure-autoconfigure-5.23.0-sources.jar  (source code)
+
+Package Structure:
+com.azure.spring.cloud.autoconfigure.implementation
+├─ context/
+│  ├─ properties/
+│  │  └─ AzureGlobalProperties.java
+│  ├─ AzureGlobalPropertiesAutoConfiguration.java
+│  └─ AzureTokenCredentialAutoConfiguration.java
+├─ properties/core/
+│  ├─ authentication/
+│  │  └─ TokenCredentialConfigurationProperties.java
+│  └─ profile/
+│     └─ AzureProfileConfigurationProperties.java
+└─ jdbc/
+   ├─ AzureJdbcAutoConfiguration.java
+   ├─ JdbcPropertiesBeanPostProcessor.java
+   └─ JdbcConnectionStringEnhancer.java
+```
+
+**To View Source in IDE:**
+1. Open any class from this package (e.g., `AzureGlobalProperties`)
+2. Your IDE will prompt to download sources
+3. Navigate through the code using "Go to Declaration" (Cmd+B / Ctrl+B)
+
+### Debugging Property Loading
+
+To verify properties are loaded correctly, enable debug logging:
+
+```yaml
+logging:
+  level:
+    com.azure.spring.cloud.autoconfigure: DEBUG
+    org.springframework.boot.context.properties: TRACE
+```
+
+**Expected Log Output:**
+```
+DEBUG c.a.s.c.a.i.j.JdbcConnectionStringEnhancer : Trying to construct enhanced jdbc url for POSTGRESQL
+DEBUG c.a.s.c.a.i.c.AzureGlobalPropertiesAutoConfiguration : Registering AzureGlobalProperties bean
+DEBUG o.s.b.c.p.ConfigurationPropertiesBinder : Binding properties: spring.cloud.azure
+DEBUG o.s.b.c.p.ConfigurationPropertiesBinder : Bound properties: AzureGlobalProperties{credential=TokenCredentialConfigurationProperties{managedIdentityEnabled=true, clientId='d8db0245-bcb2-4cd0-9ddc-8169d952fa7a'}}
+```
 
 ---
 
