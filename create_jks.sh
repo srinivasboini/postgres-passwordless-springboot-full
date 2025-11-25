@@ -16,7 +16,7 @@
 #==============================================================================
 
 # Configuration
-TECHNICAL_USER="techuser"
+TECHNICAL_USER="FA0KBSB"
 JKS_FILE="${TECHNICAL_USER}.jks"
 KEYSTORE_PASSWORD="changeit"  # CHANGE THIS to your desired password!
 KEY_ALIAS="${TECHNICAL_USER}"
@@ -56,16 +56,94 @@ fi
 
 echo "✓ All required files found"
 
-# Step 2: Create certificate chain file
+# Step 2: Clean and validate certificates
 echo ""
-echo "Step 2: Creating certificate chain..."
+echo "Step 2: Cleaning and validating certificates..."
+
+# Function to clean certificate files (remove any extra text/whitespace)
+clean_cert() {
+    local input_file=$1
+    local output_file=$2
+    
+    # Extract only the certificate part (from BEGIN to END)
+    awk '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/' "$input_file" > "$output_file.tmp"
+    
+    # Verify it's a valid certificate
+    if openssl x509 -in "$output_file.tmp" -noout 2>/dev/null; then
+        mv "$output_file.tmp" "$output_file"
+        return 0
+    else
+        echo "ERROR: Invalid certificate in $input_file"
+        rm -f "$output_file.tmp"
+        return 1
+    fi
+}
+
+# Clean user certificate
+echo "  Cleaning user certificate..."
+clean_cert "$USER_CERT" "user_cert_clean.pem"
+if [ $? -ne 0 ]; then
+    echo "ERROR: Failed to clean user certificate"
+    exit 1
+fi
+
+# Clean issuing CA certificate
+echo "  Cleaning issuing CA certificate..."
+clean_cert "$ISSUING_CA_CERT" "issuing_ca_clean.pem"
+if [ $? -ne 0 ]; then
+    echo "ERROR: Failed to clean issuing CA certificate"
+    exit 1
+fi
+
+echo "✓ Certificates cleaned and validated"
+
+# Step 3: Create certificate chain file
+echo ""
+echo "Step 3: Creating certificate chain..."
 CERT_CHAIN="cert_chain.pem"
-cat "$USER_CERT" "$ISSUING_CA_CERT" > "$CERT_CHAIN"
+cat "user_cert_clean.pem" "issuing_ca_clean.pem" > "$CERT_CHAIN"
+
+# Verify the chain file
+echo "  Verifying certificate chain..."
+cert_count=$(grep -c "BEGIN CERTIFICATE" "$CERT_CHAIN")
+echo "  Found $cert_count certificate(s) in chain"
+
+if [ $cert_count -lt 2 ]; then
+    echo "ERROR: Certificate chain should contain at least 2 certificates"
+    exit 1
+fi
+
 echo "✓ Certificate chain created: $CERT_CHAIN"
 
-# Step 3: Convert to PKCS12 format (includes private key + cert chain)
+# Step 3: Check and convert private key format if needed
 echo ""
-echo "Step 3: Creating PKCS12 keystore..."
+echo "Step 4: Checking private key format..."
+
+# Check if private key is encrypted
+if grep -q "ENCRYPTED" "$PRIVATE_KEY"; then
+    echo "WARNING: Private key is encrypted (password protected)"
+    echo "You'll need to enter the password to decrypt it..."
+    CONVERTED_KEY="private_key_decrypted.pem"
+    openssl rsa -in "$PRIVATE_KEY" -out "$CONVERTED_KEY"
+    if [ $? -ne 0 ]; then
+        echo "ERROR: Failed to decrypt private key"
+        exit 1
+    fi
+    PRIVATE_KEY="$CONVERTED_KEY"
+    echo "✓ Private key decrypted"
+elif grep -q "BEGIN RSA PRIVATE KEY" "$PRIVATE_KEY"; then
+    echo "✓ Private key format: RSA (traditional format)"
+elif grep -q "BEGIN PRIVATE KEY" "$PRIVATE_KEY"; then
+    echo "✓ Private key format: PKCS#8"
+elif grep -q "BEGIN EC PRIVATE KEY" "$PRIVATE_KEY"; then
+    echo "✓ Private key format: EC (Elliptic Curve)"
+else
+    echo "WARNING: Unknown private key format. Attempting to proceed..."
+fi
+
+# Step 4: Convert to PKCS12 format (includes private key + cert chain)
+echo ""
+echo "Step 5: Creating PKCS12 keystore..."
 openssl pkcs12 -export \
     -in "$CERT_CHAIN" \
     -inkey "$PRIVATE_KEY" \
@@ -74,14 +152,26 @@ openssl pkcs12 -export \
     -password pass:"$KEYSTORE_PASSWORD"
 
 if [ $? -ne 0 ]; then
+    echo ""
     echo "ERROR: Failed to create PKCS12 file"
+    echo ""
+    echo "Common causes:"
+    echo "1. Private key format issue - try converting it:"
+    echo "   openssl rsa -in private_key.key -out private_key_converted.pem"
+    echo ""
+    echo "2. Private key doesn't match the certificate"
+    echo "   Verify with: openssl x509 -noout -modulus -in user_certificate.crt | openssl md5"
+    echo "   And compare: openssl rsa -noout -modulus -in private_key.key | openssl md5"
+    echo ""
+    echo "3. Private key is password protected - you'll be prompted for password"
+    echo ""
     exit 1
 fi
 echo "✓ PKCS12 keystore created: $P12_FILE"
 
-# Step 4: Convert PKCS12 to JKS
+# Step 5: Convert PKCS12 to JKS
 echo ""
-echo "Step 4: Converting PKCS12 to JKS..."
+echo "Step 6: Converting PKCS12 to JKS..."
 keytool -importkeystore \
     -srckeystore "$P12_FILE" \
     -srcstoretype PKCS12 \
@@ -98,9 +188,9 @@ if [ $? -ne 0 ]; then
 fi
 echo "✓ JKS keystore created: $JKS_FILE"
 
-# Step 5: Import trusted CA certificates (single file with multiple certs)
+# Step 6: Import trusted CA certificates (single file with multiple certs)
 echo ""
-echo "Step 5: Importing trusted CA certificates..."
+echo "Step 7: Importing trusted CA certificates..."
 
 TRUSTED_CA_FILE="trusted_ca_certificates.crt"
 
@@ -125,16 +215,16 @@ else
     echo "Skipping trusted CA import. You can import them later if needed."
 fi
 
-# Step 6: Verify the keystore
+# Step 7: Verify the keystore
 echo ""
-echo "Step 6: Verifying keystore contents..."
+echo "Step 8: Verifying keystore contents..."
 echo "=========================================="
 keytool -list -v -keystore "$JKS_FILE" -storepass "$KEYSTORE_PASSWORD"
 
 # Cleanup temporary files
 echo ""
 echo "Cleaning up temporary files..."
-rm -f "$P12_FILE" "$CERT_CHAIN"
+rm -f "$P12_FILE" "$CERT_CHAIN" "user_cert_clean.pem" "issuing_ca_clean.pem" "private_key_decrypted.pem"
 
 echo ""
 echo "=========================================="
