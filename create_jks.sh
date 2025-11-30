@@ -5,7 +5,7 @@
 #==============================================================================
 # This script:
 # 1. Imports user certificate + private key into keystore
-# 2. Imports issuing CA certificate into truststore
+# 2. Imports issuing CA certificate into truststore.
 #==============================================================================
 
 # Configuration
